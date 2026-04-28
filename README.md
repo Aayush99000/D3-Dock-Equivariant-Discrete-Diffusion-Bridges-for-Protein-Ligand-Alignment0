@@ -2,7 +2,7 @@
 
 **D3-Dock** is a next-generation generative framework for protein-ligand docking. While previous models often suffer from **structural dissonance**—a mismatch between discrete chemical bonds and continuous 3D coordinates—D3-Dock uses a **Neural Schrödinger Bridge** and **Discrete Denoising Diffusion (D3PM)** to "guardrail" the folding process.
 
-![D3-Dock Architecture](architecture.png)
+![D3-Dock Architecture](images/Architecture.png)
 
 ## Key Innovations
 
