@@ -1,5 +1,7 @@
 # D3-Dock: Equivariant Discrete Diffusion for Chemically-Consistent Molecular Docking
 
+![D3-Dock Architecture](images/Architecture.png)
+
 D3-Dock is a next-generation generative framework for protein-ligand docking. While previous models like MiDi (2023) often suffer from **structural dissonance**—a mismatch between discrete chemical bonds and continuous 3D coordinates—D3-Dock uses a **Discrete Denoising Diffusion Probabilistic Model (D3PM)** to "guardrail" the folding process.
 
 ## Key Innovations
