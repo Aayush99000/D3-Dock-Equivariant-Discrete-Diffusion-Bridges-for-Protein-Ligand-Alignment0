@@ -1,29 +1,39 @@
-# D3-Dock: Equivariant Discrete Diffusion for Chemically-Consistent Molecular Docking
+# D3-Dock: Surface-Aware Equivariant Discrete Diffusion for Protein-Ligand Alignment
 
-![D3-Dock Architecture](images/Architecture.png)
+**D3-Dock** is a next-generation generative framework for protein-ligand docking. While previous models often suffer from **structural dissonance**—a mismatch between discrete chemical bonds and continuous 3D coordinates—D3-Dock uses a **Neural Schrödinger Bridge** and **Discrete Denoising Diffusion (D3PM)** to "guardrail" the folding process.
 
-D3-Dock is a next-generation generative framework for protein-ligand docking. While previous models like MiDi (2023) often suffer from **structural dissonance**—a mismatch between discrete chemical bonds and continuous 3D coordinates—D3-Dock uses a **Discrete Denoising Diffusion Probabilistic Model (D3PM)** to "guardrail" the folding process.
+![D3-Dock Architecture](architecture.png)
 
 ## Key Innovations
 
-- **Discrete-Led Refinement:** Uses a transition matrix $Q_t$ to evolve atom and bond types discretely, ensuring $100\%$ chemical valency throughout the diffusion process.
+- **Surface-Aware Physical Guardrails:** Integrates a Point Cloud Transformer to encode the protein "skin." By utilizing a **Signed Distance Function (SDF)**, the model prevents "physical hallucinations" where ligands overlap with protein atoms.
+- **Discrete-Led Refinement:** Employs a transition matrix $Q_t$ to evolve atom and bond types discretely, ensuring $100\%$ chemical valency throughout the diffusion process.
 - **$E(3)$-Equivariant Architecture:** The underlying Graph Neural Network is rotationally and translationally invariant, respecting the fundamental physics of 3D space.
-- **Schrödinger Bridge Coupling:** Instead of unconstrained generation, D3-Dock finds the optimal transport path between random noise and a target protein pocket.
-- **Parallel Generation:** Bypasses the $O(N)$ bottleneck of autoregressive models, refining the entire molecular topology in $O(1)$ parallel steps.
+- **Neural Schrödinger Bridge:** Finds the entropy-optimal transport path between random noise and the docked state, significantly improving sampling efficiency over standard diffusion.
 
-## Technical Architecture
+## 🧬 Technical Deep Dive: The Neural Schrödinger Bridge
 
-D3-Dock solves the joint distribution of topology and geometry:
+D3-Dock moves beyond standard Gaussian Diffusion by solving the pair of forward and backward Stochastic Differential Equations (SDEs) that interpolate between noise and the bound state:
 
-$$q(z_t | z_0, \text{Pocket}) = f(z_t^{\text{continuous}}, z_t^{\text{discrete}}, \text{Pocket Condition})$$
+$$d X_t = [f(X_t, t) + g^2(t) \nabla \log \Psi(X_t, t)] dt + g(t) d W_t$$
 
-By conditioning the **Discrete Transition Matrix** on the protein pocket's local geometry, we ensure that the generated ligand is not just "valid chemistry," but a high-affinity binder for that specific pocket.
+### Dual-Path Joint Denoising
+
+The core innovation is the joint evolution of continuous geometric space and discrete topological space:
+
+- **Continuous Path (Coordinates):** Estimates the score function $\nabla \log p(x_t | \text{Pocket})$ to refine the $x, y, z$ positions of atoms while adhering to a **Physical Collision Penalty** $V_{\text{collision}}$ based on the protein surface SDF.
+- **Discrete Path (Topology):** Utilizes a **D3PM** framework with a structured transition matrix $Q_t \in \mathbb{R}^{K \times K}$ to govern the probability of atom/bond "flipping" between categories (e.g., $C \rightarrow N$).
+
+$$[Q_t]_{ij} = q(z_t = j | z_{t-1} = i)$$
+
+By conditioning the **Discrete Transition Matrix** on the protein surface's local geometry and "chemical texture," we ensure the generated ligand is not just "valid chemistry," but a high-affinity binder.
 
 ## 📚 Research Context
 
-This project builds upon and addresses the bottlenecks found in:
+This project addresses the bottlenecks identified in current state-of-the-art models:
 
-- **MiDi:** Mixed Discrete-Continuous Diffusion Models for Graph Generation (Vignac et al., 2023)
-- **DiffDock:** Diffusion Steps, Twists, and Turns for Molecular Docking (Corso et al., 2024)
+- **MiDi (2023) & DiffDock (2024):** D3-Dock eliminates the "Physical Hallucination" problem where models generate valid atoms but impossible bond distances by enforcing discrete valency constraints.
+- **DiffBindFR (2025):** While DiffBindFR excels at receptor flexibility, D3-Dock provides superior **Topological Integrity** through its hybrid discrete-continuous bridge.
+- **SurfDock:** D3-Dock incorporates **Surface Awareness** as a continuous boundary constraint, rather than just a shape-matching heuristic.
 
 **The Bottleneck Solved:** D3-Dock eliminates the "Physical Hallucination" problem where models generate valid atoms but impossible bond distances by enforcing discrete valency constraints in the latent bridge.
