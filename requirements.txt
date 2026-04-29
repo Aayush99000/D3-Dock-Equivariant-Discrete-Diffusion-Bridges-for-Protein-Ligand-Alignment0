@@ -1,0 +1,40 @@
+# D3-Dock requirements for Northeastern Explorer (Rocky Linux 9, CUDA 12.x)
+
+# ---------- Deep Learning ----------
+# IMPORTANT: On Explorer, check loaded CUDA/cuDNN module versions first before install.
+# Example target stack below: PyTorch 2.2.x with CUDA 12.1 wheels.
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+
+# PyTorch Geometric stack (compatible with torch 2.2 + cu121)
+# Install wheels from:
+# https://data.pyg.org/whl/torch-2.2.2+cu121.html
+torch-geometric==2.5.3
+torch-scatter==2.1.2
+torch-sparse==0.6.18
+torch-cluster==1.6.3
+torch-spline-conv==1.2.2
+e3nn==0.5.1
+
+# ---------- Chemistry / Bioinformatics ----------
+rdkit==2023.9.6
+biopython==1.84
+
+# ---------- Geometry / Surface Processing ----------
+numpy==1.26.4
+scipy==1.12.0
+trimesh==4.4.9
+
+# ---------- PLINDER / Data ----------
+plinder
+pyarrow==15.0.2
+pandas==2.2.2
+polars==0.20.31
+google-cloud-storage==2.17.0
+
+# ---------- Utilities ----------
+tqdm==4.66.4
+psutil==5.9.8
+pyyaml==6.0.1
