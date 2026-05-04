@@ -125,7 +125,14 @@ def resolve_single_match(base_path: str, pattern: str, kind: str) -> str:
     return matches[0]
 
 
-def sanitize_ligand_with_rdkit(ligand_sdf: str, out_rdkit_sdf: str) -> None:
+def sanitize_and_protonate_ligand_rdkit(ligand_sdf: str, out_rdkit_sdf: str) -> None:
+    """
+    Sanitize with RDKit then add hydrogens via RDKit AddHs.
+    Using RDKit for both steps preserves bond orders set during sanitization —
+    OpenBabel can silently re-perceive and overwrite them when writing SDF.
+    """
+    from rdkit.Chem import AllChem
+
     supplier = Chem.SDMolSupplier(ligand_sdf, sanitize=False, removeHs=False)
     if len(supplier) == 0 or supplier[0] is None:
         raise ValueError(f"Failed to parse ligand SDF: {ligand_sdf}")
@@ -133,17 +140,29 @@ def sanitize_ligand_with_rdkit(ligand_sdf: str, out_rdkit_sdf: str) -> None:
     mol = supplier[0]
     Chem.SanitizeMol(mol)
 
+    # Remove existing Hs first to avoid duplicates, then re-add consistently.
+    mol = Chem.RemoveHs(mol)
+    mol = Chem.AddHs(mol, addCoords=True)
+
+    # Embed coordinates for any new H atoms that have no position yet.
+    if mol.GetNumConformers() > 0:
+        try:
+            AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+        except Exception:
+            pass  # Keep existing conformer if embedding fails.
+
     writer = Chem.SDWriter(out_rdkit_sdf)
     writer.write(mol)
     writer.close()
 
 
-def protonate_with_obabel(obabel_bin: str, in_path: str, out_path: str, ph: float) -> None:
-    cmd = [obabel_bin, in_path, "-O", out_path, "-p", str(ph)]
+def protonate_protein_with_obabel(obabel_bin: str, in_pdb: str, out_pdb: str, ph: float) -> None:
+    """Use OpenBabel only for protein protonation — it handles PDB residue chemistry well."""
+    cmd = [obabel_bin, in_pdb, "-O", out_pdb, "-p", str(ph)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(
-            f"OpenBabel failed for {in_path} -> {out_path}. "
+            f"OpenBabel failed for {in_pdb} -> {out_pdb}. "
             f"stderr={proc.stderr.strip()}"
         )
 
@@ -174,16 +193,15 @@ def process_job(job: Job, output_dir: str, ph: float, ligand_glob: str, protein_
 
     try:
         with tempfile.TemporaryDirectory(prefix=f"d3dock_{plinder_id}_") as tmpdir:
+            # Ligand: RDKit sanitize + AddHs (preserves bond orders).
             rdkit_sdf_tmp = os.path.join(tmpdir, "ligand.rdkit.sdf")
-            sanitize_ligand_with_rdkit(ligand_in, rdkit_sdf_tmp)
+            sanitize_and_protonate_ligand_rdkit(ligand_in, rdkit_sdf_tmp)
 
-            protonated_ligand_tmp = os.path.join(tmpdir, "ligand.protonated.sdf")
+            # Protein: OpenBabel protonation at pH 7.4 (handles residue chemistry).
             protonated_protein_tmp = os.path.join(tmpdir, "protein.protonated.pdb")
+            protonate_protein_with_obabel(obabel_bin, protein_in, protonated_protein_tmp, ph)
 
-            protonate_with_obabel(obabel_bin, rdkit_sdf_tmp, protonated_ligand_tmp, ph)
-            protonate_with_obabel(obabel_bin, protein_in, protonated_protein_tmp, ph)
-
-            os.replace(protonated_ligand_tmp, ligand_out)
+            os.replace(rdkit_sdf_tmp, ligand_out)
             os.replace(protonated_protein_tmp, protein_out)
 
         return JobResult(

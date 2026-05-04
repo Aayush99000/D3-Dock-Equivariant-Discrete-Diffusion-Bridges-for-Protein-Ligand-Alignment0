@@ -77,6 +77,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--annotation-parquet",
+        type=str,
+        default="",
+        help=(
+            "Path to local annotation_table.parquet. When provided, the parquet is "
+            "read directly (column-selective, memory-safe) instead of using the "
+            "plinder.core API."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -93,34 +103,52 @@ def _configure_logging(level: str) -> None:
     )
 
 
+def _load_plindex_from_parquet(parquet_path: str) -> pd.DataFrame:
+    """
+    Read annotation_table.parquet directly, loading only the columns we need.
+    Memory-safe: reads ~3 columns out of 743 via pyarrow column selection.
+    """
+    import pyarrow.parquet as pq
+
+    needed = [
+        "system_id",
+        "entry_resolution",
+        "ligand_molecular_weight",
+        "entry_pdb_id",
+    ]
+    pf = pq.ParquetFile(parquet_path)
+    available = {pf.schema_arrow.field(i).name for i in range(len(pf.schema_arrow))}
+    cols = [c for c in needed if c in available]
+    LOG.info("Reading parquet columns: %s", cols)
+    return pf.read(columns=cols).to_pandas()
+
+
 def _load_plindex() -> pd.DataFrame:
     """
-    Load the PLINDER index with plinder.core API.
-
-    This uses query_index() and converts the result to pandas for efficient filtering.
+    Load the full PLINDER annotation index via plinder.core API (plinder>=0.2).
+    Falls back gracefully; callers should prefer _load_plindex_from_parquet when
+    the local parquet path is known.
     """
     try:
-        from plinder.core import query_index  # type: ignore
-    except ImportError as exc:
-        raise ImportError(
-            "Could not import 'query_index' from plinder.core. "
-            "Install/activate the PLINDER environment first."
-        ) from exc
+        from plinder.core import get_plindex  # type: ignore
+        df = get_plindex()
+        return df if isinstance(df, pd.DataFrame) else df.to_pandas()
+    except Exception:
+        pass
 
-    index_obj = query_index()
+    try:
+        from plinder.core.scores import query_index  # type: ignore
+        df = query_index(
+            columns=["system_id", "entry_resolution", "ligand_molecular_weight"],
+            filters=[("entry_resolution", "<", 999.0)],
+        )
+        if df is not None:
+            return df if isinstance(df, pd.DataFrame) else df.to_pandas()
+    except Exception:
+        pass
 
-    if isinstance(index_obj, pd.DataFrame):
-        return index_obj
-
-    if hasattr(index_obj, "to_pandas"):
-        return index_obj.to_pandas()
-
-    if hasattr(index_obj, "to_df"):
-        return index_obj.to_df()
-
-    raise TypeError(
-        f"Unsupported query_index() return type: {type(index_obj)}. "
-        "Expected pandas DataFrame or an object with to_pandas()/to_df()."
+    raise ImportError(
+        "Could not load PLINDER index. Pass --annotation-parquet to read locally."
     )
 
 
@@ -141,31 +169,39 @@ def main() -> int:
     args = parser.parse_args()
     _configure_logging(args.log_level)
 
-    LOG.info("Loading PLINDER index via plinder.core.query_index()")
-    df = _load_plindex()
+    if args.annotation_parquet:
+        LOG.info("Loading PLINDER index from local parquet: %s", args.annotation_parquet)
+        df = _load_plindex_from_parquet(args.annotation_parquet)
+    else:
+        LOG.info("Loading PLINDER index via plinder.core API")
+        df = _load_plindex()
     LOG.info("Loaded index rows=%d cols=%d", len(df), len(df.columns))
 
     # Resolve key schema columns with robust aliases.
     plinder_id_col = _pick_column(
         df.columns,
-        candidates=["plinder_id", "system_id", "id"],
+        candidates=["system_id", "plinder_id", "id"],
         purpose="PLINDER system id",
     )
     resolution_col = _pick_column(
         df.columns,
-        candidates=["resolution", "resolution_angstrom", "pdb_resolution"],
+        candidates=["entry_resolution", "resolution", "resolution_angstrom", "pdb_resolution"],
         purpose="resolution",
-    )
-    apo_col = _pick_column(
-        df.columns,
-        candidates=["has_apo", "apo_available", "apo_present", "apo"],
-        purpose="apo-availability flag",
     )
     ligand_mw_col = _pick_column(
         df.columns,
-        candidates=["ligand_mw", "ligand_molecular_weight", "mol_wt", "mw"],
+        candidates=["ligand_molecular_weight", "system_ligand_max_molecular_weight",
+                    "ligand_mw", "mol_wt", "mw"],
         purpose="ligand molecular weight",
     )
+
+    # Apo availability: join against the apo links parquet if no has_apo column exists.
+    apo_col = None
+    for candidate in ["has_apo", "apo_available", "apo_present", "apo",
+                      "system_has_apo_ligand", "num_apo_chains"]:
+        if candidate in df.columns:
+            apo_col = candidate
+            break
 
     # Convert to numeric where needed, preserving NaN for non-parsable values.
     df[resolution_col] = pd.to_numeric(df[resolution_col], errors="coerce")
@@ -185,21 +221,34 @@ def main() -> int:
 
     # 2) Apo availability filter.
     before = len(df)
-    if pd.api.types.is_bool_dtype(df[apo_col]) or set(df[apo_col].dropna().unique()) <= {
-        True,
-        False,
-    }:
-        df = df[df[apo_col] == True].copy()  # noqa: E712
+    if apo_col is not None:
+        if pd.api.types.is_bool_dtype(df[apo_col]) or set(df[apo_col].dropna().unique()) <= {True, False}:
+            df = df[df[apo_col] == True].copy()  # noqa: E712
+        else:
+            normalized = (
+                df[apo_col].astype(str).str.strip().str.lower()
+                .isin({"1", "true", "t", "yes", "y", "apo"})
+            )
+            df = df[normalized].copy()
+        _log_discard("Has Apo structure (column)", before=before, after=len(df))
     else:
-        normalized = (
-            df[apo_col]
-            .astype(str)
-            .str.strip()
-            .str.lower()
-            .isin({"1", "true", "t", "yes", "y", "apo"})
+        # Derive apo availability from the downloaded apo links parquet.
+        plinder_mount = os.environ.get("PLINDER_MOUNT", "")
+        release = os.environ.get("PLINDER_RELEASE", "2024-06")
+        iteration = os.environ.get("PLINDER_ITERATION", "v2")
+        apo_links_path = os.path.join(
+            plinder_mount, release, iteration, "links", "kind=apo", "links.parquet"
         )
-        df = df[normalized].copy()
-    _log_discard("Has Apo structure", before=before, after=len(df))
+        if os.path.exists(apo_links_path):
+            apo_df = pd.read_parquet(apo_links_path, columns=["reference_system_id"])
+            apo_ids = set(apo_df["reference_system_id"].dropna().astype(str).unique())
+            df = df[df[plinder_id_col].astype(str).isin(apo_ids)].copy()
+            _log_discard("Has Apo structure (links parquet)", before=before, after=len(df))
+        else:
+            LOG.warning(
+                "No apo column found and apo links parquet missing at %s — skipping apo filter.",
+                apo_links_path,
+            )
 
     # 3) Ligand molecular weight filter.
     before = len(df)
