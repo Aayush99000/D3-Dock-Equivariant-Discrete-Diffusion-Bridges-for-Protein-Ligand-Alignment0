@@ -22,6 +22,7 @@ import glob
 import logging
 import multiprocessing as mp
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -130,9 +131,12 @@ def sanitize_and_protonate_ligand_rdkit(ligand_sdf: str, out_rdkit_sdf: str) -> 
     Sanitize with RDKit then add hydrogens via RDKit AddHs.
     Using RDKit for both steps preserves bond orders set during sanitization —
     OpenBabel can silently re-perceive and overwrite them when writing SDF.
-    """
-    from rdkit.Chem import AllChem
 
+    NOTE: EmbedMolecule is intentionally NOT called here — it regenerates
+    coordinates from scratch and would destroy the crystal-frame positions.
+    AddHs(addCoords=True) places H atoms relative to existing heavy atom
+    coordinates without modifying them.
+    """
     supplier = Chem.SDMolSupplier(ligand_sdf, sanitize=False, removeHs=False)
     if len(supplier) == 0 or supplier[0] is None:
         raise ValueError(f"Failed to parse ligand SDF: {ligand_sdf}")
@@ -140,16 +144,9 @@ def sanitize_and_protonate_ligand_rdkit(ligand_sdf: str, out_rdkit_sdf: str) -> 
     mol = supplier[0]
     Chem.SanitizeMol(mol)
 
-    # Remove existing Hs first to avoid duplicates, then re-add consistently.
+    # Remove existing Hs to avoid duplicates, re-add with crystal-frame coords.
     mol = Chem.RemoveHs(mol)
     mol = Chem.AddHs(mol, addCoords=True)
-
-    # Embed coordinates for any new H atoms that have no position yet.
-    if mol.GetNumConformers() > 0:
-        try:
-            AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-        except Exception:
-            pass  # Keep existing conformer if embedding fails.
 
     writer = Chem.SDWriter(out_rdkit_sdf)
     writer.write(mol)
@@ -192,7 +189,9 @@ def process_job(job: Job, output_dir: str, ph: float, ligand_glob: str, protein_
         )
 
     try:
-        with tempfile.TemporaryDirectory(prefix=f"d3dock_{plinder_id}_") as tmpdir:
+        tmp_base = os.path.join(output_dir, ".tmp")
+        os.makedirs(tmp_base, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=f"d3dock_{plinder_id}_", dir=tmp_base) as tmpdir:
             # Ligand: RDKit sanitize + AddHs (preserves bond orders).
             rdkit_sdf_tmp = os.path.join(tmpdir, "ligand.rdkit.sdf")
             sanitize_and_protonate_ligand_rdkit(ligand_in, rdkit_sdf_tmp)
@@ -201,8 +200,8 @@ def process_job(job: Job, output_dir: str, ph: float, ligand_glob: str, protein_
             protonated_protein_tmp = os.path.join(tmpdir, "protein.protonated.pdb")
             protonate_protein_with_obabel(obabel_bin, protein_in, protonated_protein_tmp, ph)
 
-            os.replace(rdkit_sdf_tmp, ligand_out)
-            os.replace(protonated_protein_tmp, protein_out)
+            shutil.move(rdkit_sdf_tmp, ligand_out)
+            shutil.move(protonated_protein_tmp, protein_out)
 
         return JobResult(
             plinder_id=plinder_id,
