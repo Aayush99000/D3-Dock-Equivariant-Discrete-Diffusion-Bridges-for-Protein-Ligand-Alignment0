@@ -59,6 +59,7 @@ CLUSTER_40_COL_CANDIDATES = [
     "seq_cluster_40",
     "pl40_cluster",
     "protein_cluster_40",
+    "cluster",
 ]
 
 
