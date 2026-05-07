@@ -234,12 +234,24 @@ class D3DockHeteroDataset(Dataset):
         data["protein_surface"].pos = surface_pos
         data["protein_surface"].x = torch.cat([surface_normals, hydro_t, electro_t], dim=1)
 
-        # SDF voxel grid field.
-        data["sdf_grid"] = torch.tensor(crop["sdf_grid"], dtype=torch.float32)
-        data["sdf_spacing"] = torch.tensor([float(crop["sdf_spacing"])], dtype=torch.float32)
-        data["sdf_origin_normalized"] = torch.tensor(
-            crop["sdf_origin_normalized"], dtype=torch.float32
-        )
+        # SDF voxel grid stored as a flattened "global" node feature so PyG
+        # can batch it correctly (concatenates along dim 0 → [B, flat_dim]).
+        # Grids vary slightly in size; pad to SDF_GRID_SIZE^3 with a large
+        # positive value (= far outside protein = no collision penalty).
+        SDF_GRID_SIZE = 41
+        sdf_np = crop["sdf_grid"]
+        sdf_padded = np.full((SDF_GRID_SIZE,) * 3, fill_value=10.0, dtype=np.float32)
+        x, y, z = sdf_np.shape
+        sdf_padded[:x, :y, :z] = sdf_np
+        data["global"].sdf_grid = torch.tensor(
+            sdf_padded.ravel()[None], dtype=torch.float32
+        )  # (1, SDF_GRID_SIZE^3)
+        data["global"].sdf_spacing = torch.tensor(
+            [[float(crop["sdf_spacing"])]], dtype=torch.float32
+        )  # (1, 1)
+        data["global"].sdf_origin = torch.tensor(
+            crop["sdf_origin_normalized"][None], dtype=torch.float32
+        )  # (1, 3)
 
         return data
 

@@ -314,10 +314,11 @@ def train_one_epoch(
 
         # Physical penalty using SDF (negative SDF => overlap/collision).
         x0_hat = x_t - node_sigma * out.coord_noise
+        sdf_grid_3d = batch["global"].sdf_grid.view(-1, 41, 41, 41)  # (B, 41, 41, 41)
         sdf_vals = sample_sdf_trilinear(
-            sdf_grid=batch["sdf_grid"].float(),
-            sdf_origin=batch["sdf_origin_normalized"].float(),
-            sdf_spacing=batch["sdf_spacing"].float(),
+            sdf_grid=sdf_grid_3d.float(),
+            sdf_origin=batch["global"].sdf_origin.float(),
+            sdf_spacing=batch["global"].sdf_spacing.float(),
             points=x0_hat,
             point_batch=lig_batch,
         )
@@ -423,7 +424,7 @@ def main() -> None:
         num_bond_classes=args.num_bond_classes,
     ).to(device)
     if distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
     schedule = build_schedule(
         T=args.T,
