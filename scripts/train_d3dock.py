@@ -18,7 +18,7 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
 import numpy as np
 import torch
@@ -82,6 +82,12 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save-every", type=int, default=1)
+    p.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint .pt file to resume from, or 'auto' to load latest in --output-dir.",
+    )
     return p.parse_args()
 
 
@@ -403,6 +409,11 @@ def save_checkpoint(
     torch.save(state, os.path.join(out_dir, f"checkpoint_epoch_{epoch:04d}.pt"))
 
 
+def find_latest_checkpoint(out_dir: str) -> Optional[str]:
+    ckpts = sorted(Path(out_dir).glob("checkpoint_epoch_*.pt"))
+    return str(ckpts[-1]) if ckpts else None
+
+
 def main() -> None:
     args = parse_args()
     distributed, rank, world_size, local_rank = init_distributed()
@@ -448,7 +459,23 @@ def main() -> None:
         final_div_factor=100.0,
     )
 
-    for epoch in range(1, args.epochs + 1):
+    start_epoch = 1
+    resume_path = args.resume
+    if resume_path == "auto":
+        resume_path = find_latest_checkpoint(args.output_dir)
+    if resume_path is not None:
+        if rank == 0:
+            print(f"[D3-Dock] Resuming from checkpoint: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        raw_model = model.module if distributed else model
+        raw_model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt["epoch"] + 1
+        if rank == 0:
+            print(f"[D3-Dock] Resuming from epoch {start_epoch}")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         if sampler is not None:
             sampler.set_epoch(epoch)
 
