@@ -7,6 +7,7 @@ Implements:
 - RMSD metrics vs ground-truth ligand poses.
 - Geometry success rate (RMSD < 2.0 A).
 - PoseBusters wrapper for physical validity checks.
+- Surface-Ligand Overlap metric via trilinear SDF sampling.
 - SDF export for PyMOL visualization.
 """
 
@@ -18,6 +19,7 @@ import math
 import os
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -73,6 +75,20 @@ def parse_args() -> argparse.Namespace:
         "--posebusters-bin",
         default="bust",
         help="PoseBusters CLI executable (default: bust).",
+    )
+    p.add_argument(
+        "--surface-dir",
+        default=None,
+        help=(
+            "Directory containing per-system .surface_awareness.npz files "
+            "(output of 03_surface.sh). Required for Surface-Ligand Overlap metrics."
+        ),
+    )
+    p.add_argument(
+        "--overlap-violation-thresh",
+        type=float,
+        default=0.1,
+        help="SDF penetration depth (Å) below which an atom is considered clean (default: 0.1).",
     )
     return p.parse_args()
 
@@ -300,6 +316,103 @@ def run_posebusters(
     return payload
 
 
+@dataclass
+class SdfMeta:
+    sdf_grid: np.ndarray   # (X, Y, Z) float32, world-space SDF values
+    origin: np.ndarray     # (3,) float32, world-space grid origin
+    spacing: float         # voxel size in Angstroms
+
+
+def load_sdf_meta(surface_dir: str, plinder_id: str) -> Optional[SdfMeta]:
+    """Load the precomputed SDF grid from the surface_awareness.npz for one system."""
+    path = Path(surface_dir) / f"{plinder_id}.surface_awareness.npz"
+    if not path.exists():
+        return None
+    d = np.load(str(path), allow_pickle=True)
+    return SdfMeta(
+        sdf_grid=d["sdf_grid"].astype(np.float32),
+        origin=d["origin"].astype(np.float32),
+        spacing=float(d["spacing"]),
+    )
+
+
+def _trilinear_sample(grid: np.ndarray, idx: np.ndarray) -> np.ndarray:
+    """
+    Trilinear interpolation of a 3-D scalar grid at fractional index positions.
+
+    grid : (X, Y, Z) float32
+    idx  : (N, 3) float  — fractional grid indices (x, y, z)
+    returns (N,) float32 SDF values
+    """
+    X, Y, Z = grid.shape
+    x0 = np.floor(idx[:, 0]).astype(np.int32)
+    y0 = np.floor(idx[:, 1]).astype(np.int32)
+    z0 = np.floor(idx[:, 2]).astype(np.int32)
+    x1 = x0 + 1
+    y1 = y0 + 1
+    z1 = z0 + 1
+
+    # Clamp indices to valid range
+    x0c = np.clip(x0, 0, X - 1); x1c = np.clip(x1, 0, X - 1)
+    y0c = np.clip(y0, 0, Y - 1); y1c = np.clip(y1, 0, Y - 1)
+    z0c = np.clip(z0, 0, Z - 1); z1c = np.clip(z1, 0, Z - 1)
+
+    # Interpolation weights — clamped to [0,1] for atoms outside the grid
+    xd = np.clip(idx[:, 0] - x0, 0.0, 1.0)
+    yd = np.clip(idx[:, 1] - y0, 0.0, 1.0)
+    zd = np.clip(idx[:, 2] - z0, 0.0, 1.0)
+
+    return (
+        grid[x0c, y0c, z0c] * (1 - xd) * (1 - yd) * (1 - zd)
+        + grid[x1c, y0c, z0c] * xd       * (1 - yd) * (1 - zd)
+        + grid[x0c, y1c, z0c] * (1 - xd) * yd       * (1 - zd)
+        + grid[x0c, y0c, z1c] * (1 - xd) * (1 - yd) * zd
+        + grid[x1c, y1c, z0c] * xd       * yd       * (1 - zd)
+        + grid[x1c, y0c, z1c] * xd       * (1 - yd) * zd
+        + grid[x0c, y1c, z1c] * (1 - xd) * yd       * zd
+        + grid[x1c, y1c, z1c] * xd       * yd       * zd
+    ).astype(np.float32)
+
+
+def compute_surface_overlap(
+    ligand_pos_world: np.ndarray,
+    sdf_meta: SdfMeta,
+    violation_thresh: float = 0.1,
+) -> dict:
+    """
+    Measure how much the predicted ligand penetrates the protein surface.
+
+    ligand_pos_world : (N_atoms, 3) float — heavy-atom positions in world space (Å)
+    sdf_meta         : precomputed SDF grid in world space
+    violation_thresh : penetration depth (Å) below which an atom is "clean"
+
+    Returns a dict with per-system Surface-Ligand Overlap metrics.
+
+    Convention: SDF < 0  →  atom is inside the protein (violation).
+    """
+    # Transform world coordinates → fractional grid indices
+    # grid_idx = (world_pos - origin) / spacing
+    idx = (ligand_pos_world - sdf_meta.origin[None, :]) / sdf_meta.spacing  # (N, 3)
+    sdf_vals = _trilinear_sample(sdf_meta.sdf_grid, idx)                     # (N,)
+
+    n_atoms = len(sdf_vals)
+    # Penetration depth per atom: positive when inside protein, 0 otherwise
+    penetration = np.maximum(0.0, -sdf_vals)
+
+    n_violations    = int((sdf_vals < 0).sum())
+    # Clean: violation depth < violation_thresh (includes atoms outside protein)
+    n_clean         = int((sdf_vals > -violation_thresh).sum())
+
+    return {
+        "slo_n_atoms":              n_atoms,
+        "slo_n_violations":         n_violations,
+        "slo_violation_fraction":   round(float(n_violations / n_atoms), 4),
+        "slo_mean_overlap_depth_A": round(float(penetration.mean()), 4),
+        "slo_max_overlap_depth_A":  round(float(penetration.max()), 4),
+        "slo_clean_surface_rate":   round(float(n_clean / n_atoms), 4),
+    }
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -333,6 +446,7 @@ def main() -> None:
     all_metrics = []
     rmsd_values = []
     success_count = 0
+    slo_records: list[dict] = []   # surface-ligand overlap per sample
 
     # Process samples one-by-one for robust molecule serialization.
     for idx in indices:
@@ -381,6 +495,33 @@ def main() -> None:
             output_json=str(poser_json),
         )
 
+        # ── Surface-Ligand Overlap ────────────────────────────────────────────
+        slo_metrics: dict = {}
+        if args.surface_dir:
+            sdf_meta = load_sdf_meta(args.surface_dir, rec.plinder_id)
+            if sdf_meta is not None:
+                # pred_pos is in COM-normalised space; add the ligand COM (from
+                # crop.npz) to recover world-space coordinates before sampling.
+                crop_path = (
+                    Path(args.crop_dir)
+                    / rec.plinder_id
+                    / f"{rec.plinder_id}.crop.npz"
+                )
+                try:
+                    crop = np.load(str(crop_path), allow_pickle=True)
+                    com = crop["ligand_center_of_mass"].astype(np.float32)  # (3,)
+                    pred_world = pred_pos.detach().cpu().numpy().astype(np.float32) + com
+                    slo_metrics = compute_surface_overlap(
+                        ligand_pos_world=pred_world,
+                        sdf_meta=sdf_meta,
+                        violation_thresh=args.overlap_violation_thresh,
+                    )
+                    slo_records.append(slo_metrics)
+                except Exception as e:
+                    slo_metrics = {"slo_error": str(e)}
+            else:
+                slo_metrics = {"slo_error": "surface_awareness.npz not found"}
+
         metric_row = {
             "plinder_id": rec.plinder_id,
             "rmsd": float(rmsd) if np.isfinite(rmsd) else None,
@@ -388,9 +529,16 @@ def main() -> None:
             "pred_sdf": str(sdf_out),
             "posebusters_json": str(poser_json),
             "posebusters_status": "ok" if "error" not in pb else "error",
+            **slo_metrics,
         }
         all_metrics.append(metric_row)
-        print(f"[{rec.plinder_id}] rmsd={metric_row['rmsd']} success={success}")
+        slo_str = (
+            f" | slo_viol={slo_metrics.get('slo_violation_fraction', 'n/a')}"
+            f" clean={slo_metrics.get('slo_clean_surface_rate', 'n/a')}"
+            f" max_depth={slo_metrics.get('slo_max_overlap_depth_A', 'n/a')}Å"
+            if slo_metrics and "slo_error" not in slo_metrics else ""
+        )
+        print(f"[{rec.plinder_id}] rmsd={metric_row['rmsd']} success={success}{slo_str}")
 
     total = len(all_metrics)
     success_rate = float(success_count / total) if total > 0 else 0.0
@@ -403,12 +551,36 @@ def main() -> None:
     import pandas as pd
 
     pd.DataFrame(all_metrics).to_csv(metrics_csv, index=False)
+    # ── Aggregate Surface-Ligand Overlap stats ────────────────────────────────
+    slo_summary: dict = {}
+    if slo_records:
+        def _mean(key: str) -> float:
+            vals = [r[key] for r in slo_records if key in r]
+            return round(float(np.mean(vals)), 4) if vals else float("nan")
+
+        slo_summary = {
+            "slo_samples_evaluated":        len(slo_records),
+            "slo_mean_violation_fraction":  _mean("slo_violation_fraction"),
+            "slo_mean_overlap_depth_A":     _mean("slo_mean_overlap_depth_A"),
+            "slo_mean_max_overlap_depth_A": _mean("slo_max_overlap_depth_A"),
+            "slo_mean_clean_surface_rate":  _mean("slo_clean_surface_rate"),
+            # Fraction of poses with zero violations (fully clash-free)
+            "slo_clash_free_rate": round(
+                float(
+                    sum(1 for r in slo_records if r.get("slo_n_violations", 1) == 0)
+                    / len(slo_records)
+                ),
+                4,
+            ),
+        }
+
     summary = {
         "total_samples": total,
         "mean_rmsd": mean_rmsd,
         "median_rmsd": median_rmsd,
         "success_rate_rmsd_lt_2A": success_rate,
         "rmsd_threshold": args.rmsd_threshold,
+        **slo_summary,
         "metrics_csv": str(metrics_csv),
         "pred_sdf_dir": str(pred_sdf_dir),
         "posebusters_dir": str(poser_dir),
