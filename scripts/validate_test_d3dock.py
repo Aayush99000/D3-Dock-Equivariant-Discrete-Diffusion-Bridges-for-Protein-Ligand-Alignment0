@@ -273,7 +273,7 @@ def _compute_rmsd(ref_mol: Chem.Mol, pred_mol: Chem.Mol) -> float:
 
 
 def run_posebusters(
-    poserbusters_bin: str,
+    posebusters_bin: str,
     sdf_path: str,
     protein_pdb: str,
     output_json: str,
