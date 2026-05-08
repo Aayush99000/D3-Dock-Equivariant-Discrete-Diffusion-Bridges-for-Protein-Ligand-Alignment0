@@ -116,9 +116,8 @@ def _extract_plinder_ids_from_split_list(split_list: str) -> set[str]:
             s = line.strip()
             if not s:
                 continue
-            stem = Path(s).stem
-            pid = stem.split(".")[0]
-            ids.add(pid)
+            # Parent directory name is the full plinder_id (e.g. 1a2c__1__1.B__1.D)
+            ids.add(Path(s).parent.name)
     return ids
 
 
