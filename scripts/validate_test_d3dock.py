@@ -488,7 +488,7 @@ def main() -> None:
         protein_pdb = rec.holo_pdb
         poser_json = poser_dir / f"{rec.plinder_id}.posebusters.json"
         pb = run_posebusters(
-            poserbusters_bin=args.posebusters_bin,
+            posebusters_bin=args.posebusters_bin,
             sdf_path=str(sdf_out),
             protein_pdb=protein_pdb,
             output_json=str(poser_json),
