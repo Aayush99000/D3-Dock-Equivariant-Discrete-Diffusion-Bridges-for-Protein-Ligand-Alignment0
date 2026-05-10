@@ -452,23 +452,31 @@ def main() -> None:
         rec = dataset.records[idx]
         data = dataset[idx].to(device)
 
-        pred_pos, atom_logits, bond_logits, bond_edge_index = reverse_diffusion_sample(
-            model=model,
-            data=data,
-            T=args.T,
-            schedule_name=args.schedule,
-            beta_start=args.beta_start,
-            beta_end=args.beta_end,
-            device=device,
-        )
+        with torch.no_grad():
+            pred_pos, atom_logits, bond_logits, bond_edge_index = reverse_diffusion_sample(
+                model=model,
+                data=data,
+                T=args.T,
+                schedule_name=args.schedule,
+                beta_start=args.beta_start,
+                beta_end=args.beta_end,
+                device=device,
+            )
+
+        # pred_pos is COM-normalised; recover world-space coords by adding the
+        # ligand centre of mass stored in the crop.npz.
+        crop_path = Path(args.crop_dir) / rec.plinder_id / f"{rec.plinder_id}.crop.npz"
+        try:
+            com = np.load(str(crop_path), allow_pickle=True)["ligand_center_of_mass"].astype(np.float64)
+        except Exception:
+            com = np.zeros(3, dtype=np.float64)
+        pred_pos_world = pred_pos.detach().cpu().numpy().astype(np.float64) + com
 
         ref_supplier = Chem.SDMolSupplier(rec.ligand_sdf, sanitize=False, removeHs=False)
         if len(ref_supplier) == 0 or ref_supplier[0] is None:
             continue
         ref_mol = ref_supplier[0]
-        pred_mol = _set_mol_coords(
-            ref_mol, pred_pos.detach().cpu().numpy().astype(np.float64)
-        )
+        pred_mol = _set_mol_coords(ref_mol, pred_pos_world)
         pred_mol = _apply_discrete_predictions(
             pred_mol, atom_logits, bond_logits, bond_edge_index
         )
@@ -499,19 +507,9 @@ def main() -> None:
         if args.surface_dir:
             sdf_meta = load_sdf_meta(args.surface_dir, rec.plinder_id)
             if sdf_meta is not None:
-                # pred_pos is in COM-normalised space; add the ligand COM (from
-                # crop.npz) to recover world-space coordinates before sampling.
-                crop_path = (
-                    Path(args.crop_dir)
-                    / rec.plinder_id
-                    / f"{rec.plinder_id}.crop.npz"
-                )
                 try:
-                    crop = np.load(str(crop_path), allow_pickle=True)
-                    com = crop["ligand_center_of_mass"].astype(np.float32)  # (3,)
-                    pred_world = pred_pos.detach().cpu().numpy().astype(np.float32) + com
                     slo_metrics = compute_surface_overlap(
-                        ligand_pos_world=pred_world,
+                        ligand_pos_world=pred_pos_world.astype(np.float32),
                         sdf_meta=sdf_meta,
                         violation_thresh=args.overlap_violation_thresh,
                     )
