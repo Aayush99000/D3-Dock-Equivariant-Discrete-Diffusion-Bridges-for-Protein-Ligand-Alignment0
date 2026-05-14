@@ -200,34 +200,50 @@ class D3DockHeteroDataset(Dataset):
         apo_info = _load_protein_features(rec.apo_pdb) if rec.apo_pdb else None
         crop = np.load(rec.crop_npz)
 
+        # All coordinates are normalized by subtracting ligand COM so that
+        # ligand, protein atoms, surface, and SDF grid share the same origin.
+        # This must use the same COM stored during crop_equivariant_cube.py.
+        lig_com = torch.tensor(
+            crop["ligand_center_of_mass"].astype(np.float32), dtype=torch.float32
+        )  # (3,)
+
         data = HeteroData()
         data["plinder_id"] = rec.plinder_id
 
-        # Ligand node features: atomic number, chirality, hybridization.
-        lig_x, lig_pos = _build_ligand_node_features(ligand_mol)
+        # Ligand: atom-type features from RDKit mol; positions from the crop
+        # (already COM-normalized: ligand_coords_normalized = raw_pos - lig_com).
+        lig_x, _ = _build_ligand_node_features(ligand_mol)
+        lig_pos = torch.tensor(
+            crop["ligand_coords_normalized"].astype(np.float32), dtype=torch.float32
+        )
         edge_index, edge_attr = _build_ligand_edges(ligand_mol)
         data["ligand"].x = lig_x
         data["ligand"].pos = lig_pos
         data["ligand", "bond", "ligand"].edge_index = edge_index
         data["ligand", "bond", "ligand"].edge_attr = edge_attr
 
-        # Protein atoms (default to holo).
+        # Protein atoms: subtract same lig_com so they are in the same frame
+        # as the surface and SDF.
+        holo_pos_norm = holo_info["pos"] - lig_com[None, :]
         data["protein_atoms"].x = holo_info["x"]
-        data["protein_atoms"].pos = holo_info["pos"]
+        data["protein_atoms"].pos = holo_pos_norm
         data["protein_atoms_holo"].x = holo_info["x"]
-        data["protein_atoms_holo"].pos = holo_info["pos"]
+        data["protein_atoms_holo"].pos = holo_pos_norm
         if apo_info is not None:
+            apo_pos_norm = apo_info["pos"] - lig_com[None, :]
             data["protein_atoms_apo"].x = apo_info["x"]
-            data["protein_atoms_apo"].pos = apo_info["pos"]
+            data["protein_atoms_apo"].pos = apo_pos_norm
             data["has_apo"] = torch.tensor([1], dtype=torch.long)
         else:
             data["has_apo"] = torch.tensor([0], dtype=torch.long)
 
         # Surface features: normals + hydrophobicity + electrostatic potential.
+        # surface_points_normalized is already COM-normalized; protein positions
+        # are now also COM-normalized, so the KD-tree search is in the correct frame.
         surface_pos = torch.tensor(crop["surface_points_normalized"], dtype=torch.float32)
         surface_normals = torch.tensor(crop["surface_normals"], dtype=torch.float32)
         hydro, electro = _surface_scalar_features(
-            surface_pos.numpy(), holo_info["pos"].numpy(), holo_info["aa_idx"].numpy()
+            surface_pos.numpy(), holo_pos_norm.numpy(), holo_info["aa_idx"].numpy()
         )
         hydro_t = torch.tensor(hydro[:, None], dtype=torch.float32)
         electro_t = torch.tensor(electro[:, None], dtype=torch.float32)
