@@ -223,7 +223,8 @@ def reverse_diffusion_sample(
 
     for t in reversed(range(T)):
         lig.pos = x_t
-        out = model(data)
+        t_tensor = torch.tensor([t], dtype=torch.long, device=device)
+        out = model(data, t=t_tensor)
         eps_theta = out.coord_noise
 
         alpha_t = sched.alphas[t]

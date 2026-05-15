@@ -309,7 +309,7 @@ def train_one_epoch(
         )
         edge_store.edge_attr[:, 0] = bond_noisy.float()
 
-        out = model(batch)
+        out = model(batch, t=t)
 
         # Continuous loss (score/noise prediction).
         loss_cont = F.mse_loss(out.coord_noise, eps)

@@ -5,7 +5,8 @@ D3-Dock dual-branch equivariant architecture.
 Core blocks:
 - Shared E(3)-equivariant encoder for ligand/protein-atom graphs (e3nn Irreps).
 - Surface point-cloud transformer for protein surface points + normals/scalars.
-- Cross-attention fusion from surface features into ligand node embeddings.
+- Cross-attention fusion: surface → ligand, protein-atoms → ligand.
+- Sinusoidal timestep embedding injected into scalar features (critical for diffusion).
 - Dual heads:
   - Continuous coordinate score/noise head (SE(3)-equivariant).
   - Discrete D3PM heads for atom-type and bond-order logits.
@@ -13,6 +14,7 @@ Core blocks:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -28,6 +30,34 @@ def _get_batch(node_store, n: int, device: torch.device) -> torch.Tensor:
     if hasattr(node_store, "batch") and node_store.batch is not None:
         return node_store.batch
     return torch.zeros(n, dtype=torch.long, device=device)
+
+
+class SinusoidalTimestepEmbedding(nn.Module):
+    """
+    Sinusoidal positional encoding for diffusion timesteps, followed by a 2-layer MLP.
+    Standard in DDPM / DiffSBDD / DiffDock. Projects t in [0, T-1] → R^dim.
+    """
+
+    def __init__(self, dim: int, max_period: int = 10000) -> None:
+        super().__init__()
+        assert dim % 2 == 0, "dim must be even for sinusoidal embedding"
+        self.dim = dim
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(half, dtype=torch.float32) / (half - 1)
+        )
+        self.register_buffer("freqs", freqs)  # (half,)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        # t: (B,) long or float
+        x = t.float().unsqueeze(-1) * self.freqs.unsqueeze(0)  # (B, half)
+        emb = torch.cat([x.sin(), x.cos()], dim=-1)            # (B, dim)
+        return self.mlp(emb)                                    # (B, dim)
 
 
 class RadialMLP(nn.Module):
@@ -74,7 +104,7 @@ class EquivariantMessageLayer(nn.Module):
     def forward(
         self, feat: torch.Tensor, pos: torch.Tensor, edge_index: torch.Tensor
     ) -> torch.Tensor:
-        src, dst = edge_index  # messages src -> dst
+        src, dst = edge_index
         edge_vec = pos[dst] - pos[src]
         edge_len = edge_vec.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
@@ -162,46 +192,51 @@ class SurfacePointTransformer(nn.Module):
         self, surface_pos: torch.Tensor, surface_x: torch.Tensor, batch: torch.Tensor
     ) -> torch.Tensor:
         h = self.feat_proj(surface_x) + self.pos_proj(surface_pos)
-        # Run attention independently per graph in the mini-batch.
         out = torch.zeros_like(h)
         for b in batch.unique(sorted=True):
             idx = (batch == b).nonzero(as_tuple=False).view(-1)
-            hb = h[idx].unsqueeze(0)  # [1, Ns, C]
+            hb = h[idx].unsqueeze(0)  # (1, Ns, C)
             out[idx] = self.encoder(hb).squeeze(0)
         return out
 
 
-class SurfaceToLigandCrossAttention(nn.Module):
-    def __init__(self, ligand_scalar_dim: int, surface_dim: int, num_heads: int = 8) -> None:
+class CrossAttentionFusion(nn.Module):
+    """
+    Generic cross-attention: ligand atoms (query) attend to a context (key/value).
+    Used for both surface→ligand and protein-atoms→ligand fusion.
+    """
+
+    def __init__(
+        self, ligand_dim: int, context_dim: int, num_heads: int = 8
+    ) -> None:
         super().__init__()
-        self.query_proj = nn.Linear(ligand_scalar_dim, ligand_scalar_dim)
-        self.kv_proj = nn.Linear(surface_dim, ligand_scalar_dim)
+        self.query_proj = nn.Linear(ligand_dim, ligand_dim)
+        self.kv_proj = nn.Linear(context_dim, ligand_dim)
         self.attn = nn.MultiheadAttention(
-            embed_dim=ligand_scalar_dim, num_heads=num_heads, batch_first=True
+            embed_dim=ligand_dim, num_heads=num_heads, batch_first=True
         )
-        self.out_norm = nn.LayerNorm(ligand_scalar_dim)
+        self.out_norm = nn.LayerNorm(ligand_dim)
         self.out_mlp = nn.Sequential(
-            nn.Linear(ligand_scalar_dim, ligand_scalar_dim),
+            nn.Linear(ligand_dim, ligand_dim),
             nn.GELU(),
-            nn.Linear(ligand_scalar_dim, ligand_scalar_dim),
+            nn.Linear(ligand_dim, ligand_dim),
         )
 
     def forward(
         self,
         ligand_scalar: torch.Tensor,
         ligand_batch: torch.Tensor,
-        surface_latent: torch.Tensor,
-        surface_batch: torch.Tensor,
+        context: torch.Tensor,
+        context_batch: torch.Tensor,
     ) -> torch.Tensor:
         out = ligand_scalar.clone()
         for b in ligand_batch.unique(sorted=True):
             lig_idx = (ligand_batch == b).nonzero(as_tuple=False).view(-1)
-            surf_idx = (surface_batch == b).nonzero(as_tuple=False).view(-1)
-            if lig_idx.numel() == 0 or surf_idx.numel() == 0:
+            ctx_idx = (context_batch == b).nonzero(as_tuple=False).view(-1)
+            if lig_idx.numel() == 0 or ctx_idx.numel() == 0:
                 continue
-
             q = self.query_proj(ligand_scalar[lig_idx]).unsqueeze(0)
-            kv = self.kv_proj(surface_latent[surf_idx]).unsqueeze(0)
+            kv = self.kv_proj(context[ctx_idx]).unsqueeze(0)
             fused, _ = self.attn(q, kv, kv, need_weights=False)
             fused = fused.squeeze(0)
             out[lig_idx] = self.out_norm(ligand_scalar[lig_idx] + self.out_mlp(fused))
@@ -219,6 +254,11 @@ class D3DockOutput:
 class D3DockModel(nn.Module):
     """
     Dual-branch D3-Dock model with equivariant coordinate head and D3PM logits.
+
+    forward(data, t) — t is required: per-graph timestep tensor (B,) long.
+    Without timestep conditioning the noise predictor cannot distinguish
+    denoising at t=999 (pure noise) from t=1 (near-clean), making the
+    reverse diffusion chain diverge.
     """
 
     def __init__(
@@ -238,8 +278,8 @@ class D3DockModel(nn.Module):
         super().__init__()
         self.protein_radius = protein_radius
         self.protein_max_neighbors = protein_max_neighbors
+        self.scalar_dim = hidden_scalar_channels
 
-        # Shared backbone instantiated once and reused for both graphs.
         self.shared_encoder_lig = SharedEquivariantEncoder(
             input_scalar_dim=ligand_input_dim,
             num_scalar_channels=hidden_scalar_channels,
@@ -255,14 +295,21 @@ class D3DockModel(nn.Module):
             num_layers=num_gnn_layers,
         )
 
-        self.scalar_dim = hidden_scalar_channels
         self.irreps_hidden = self.shared_encoder_lig.irreps_hidden
+
+        # Sinusoidal timestep embedding — projects t → scalar_dim additive bias.
+        self.time_embed = SinusoidalTimestepEmbedding(dim=hidden_scalar_channels)
 
         self.surface_encoder = SurfacePointTransformer(
             input_dim=surface_input_dim, model_dim=128, num_heads=8, num_layers=3
         )
-        self.surface_to_ligand = SurfaceToLigandCrossAttention(
-            ligand_scalar_dim=self.scalar_dim, surface_dim=128, num_heads=8
+        # Surface cross-attention (surface 128-dim → ligand scalar_dim).
+        self.surface_to_ligand = CrossAttentionFusion(
+            ligand_dim=self.scalar_dim, context_dim=128, num_heads=8
+        )
+        # Protein-atom cross-attention (protein scalar_dim → ligand scalar_dim).
+        self.protein_to_ligand = CrossAttentionFusion(
+            ligand_dim=self.scalar_dim, context_dim=self.scalar_dim, num_heads=8
         )
 
         # Continuous SE(3)-equivariant coordinate head (vector output).
@@ -291,7 +338,11 @@ class D3DockModel(nn.Module):
             max_num_neighbors=self.protein_max_neighbors,
         )
 
-    def forward(self, data: HeteroData) -> D3DockOutput:
+    def forward(self, data: HeteroData, t: torch.Tensor) -> D3DockOutput:
+        """
+        data : HeteroData batch (all coordinates COM-normalized)
+        t    : (B,) long — diffusion timestep per graph in the batch
+        """
         lig = data["ligand"]
         prot = data["protein_atoms"]
         surf = data["protein_surface"]
@@ -308,37 +359,44 @@ class D3DockModel(nn.Module):
         surf_pos = surf.pos.float()
         surf_batch = _get_batch(surf, surf_x.size(0), surf_x.device)
 
-        # Ligand graph edges from chemistry graph.
         bond_edge_index = data["ligand", "bond", "ligand"].edge_index.long()
-
-        # Protein graph edges from local geometric neighborhood.
         protein_edge_index = self._protein_edges(prot_pos, prot_batch)
 
+        # Equivariant encoders.
         lig_feat = self.shared_encoder_lig(lig_x, lig_pos, bond_edge_index)
-        _ = self.shared_encoder_prot(prot_x, prot_pos, protein_edge_index)
+        prot_feat = self.shared_encoder_prot(prot_x, prot_pos, protein_edge_index)
 
-        # Scalar channels are first in our hidden irreps layout.
         lig_scalar = lig_feat[:, : self.scalar_dim]
+        prot_scalar = prot_feat[:, : self.scalar_dim]
 
+        # Timestep embedding: inject into per-atom scalar features via lig_batch index.
+        time_emb = self.time_embed(t)               # (B, scalar_dim)
+        lig_scalar = lig_scalar + time_emb[lig_batch]
+
+        # Surface cross-attention.
         surface_latent = self.surface_encoder(surf_pos, surf_x, surf_batch)
         fused_scalar = self.surface_to_ligand(
             ligand_scalar=lig_scalar,
             ligand_batch=lig_batch,
-            surface_latent=surface_latent,
-            surface_batch=surf_batch,
+            context=surface_latent,
+            context_batch=surf_batch,
         )
 
-        # Inject fused scalar channels back into full irreps feature.
+        # Protein-atom cross-attention: gives ligand atoms direct structural context.
+        fused_scalar = self.protein_to_ligand(
+            ligand_scalar=fused_scalar,
+            ligand_batch=lig_batch,
+            context=prot_scalar,
+            context_batch=prot_batch,
+        )
+
+        # Inject fused scalar channels back into full irreps feature for coord head.
         fused_feat = lig_feat.clone()
         fused_feat[:, : self.scalar_dim] = fused_scalar
 
-        # Continuous equivariant output (vector per ligand atom).
-        coord_noise = self.coord_head(fused_feat)  # [N_lig, 3]
-
-        # Discrete atom-type logits.
+        coord_noise = self.coord_head(fused_feat)       # (N_lig, 3)
         atom_type_logits = self.atom_head(fused_scalar)
 
-        # Discrete bond-type logits.
         src, dst = bond_edge_index
         bond_dist = (lig_pos[src] - lig_pos[dst]).norm(dim=-1, keepdim=True)
         bond_feat = torch.cat([fused_scalar[src], fused_scalar[dst], bond_dist], dim=-1)
@@ -350,4 +408,3 @@ class D3DockModel(nn.Module):
             bond_type_logits=bond_type_logits,
             bond_edge_index=bond_edge_index,
         )
-
