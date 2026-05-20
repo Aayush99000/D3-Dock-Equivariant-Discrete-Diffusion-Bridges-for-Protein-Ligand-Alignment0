@@ -311,8 +311,10 @@ def train_one_epoch(
 
         out = model(batch, t=t)
 
-        # Continuous loss (score/noise prediction).
-        loss_cont = F.mse_loss(out.coord_noise, eps)
+        # x0 prediction: model directly predicts clean coordinates.
+        # More stable than epsilon prediction — output is bounded (~±20A),
+        # no 1/sqrt(alpha_bar_t) amplification in the reverse chain.
+        loss_cont = F.mse_loss(out.coord_noise, x0)
 
         # Discrete D3PM losses.
         loss_atom = F.cross_entropy(out.atom_type_logits, atom_target)

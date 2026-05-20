@@ -195,8 +195,14 @@ def reverse_diffusion_sample(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Reverse process (DDPM-like bridge approximation):
-      x_{t-1} = 1/sqrt(alpha_t) * (x_t - beta_t/sqrt(1-a_bar_t) * eps_theta) + sigma_t*z
+    Reverse process using x0-parameterized DDPM posterior.
+
+    The model predicts x0 (clean coordinates) directly rather than epsilon.
+    This prevents the 1/sqrt(alpha_bar_t) amplification that causes coordinate
+    explosion with epsilon prediction over 1000 steps.
+
+    Posterior mean: mu_{t-1} = sqrt(abar_{t-1})*beta_t/(1-abar_t) * x0_hat
+                              + sqrt(alpha_t)*(1-abar_{t-1})/(1-abar_t) * x_t
     """
     sched = build_schedule(
         T=T,
@@ -208,9 +214,8 @@ def reverse_diffusion_sample(
 
     lig = data["ligand"]
     edge = data["ligand", "bond", "ligand"]
-    x_t = torch.randn_like(lig.pos)  # start from noise
+    x_t = torch.randn_like(lig.pos)  # start from noise ~ N(0,1)
 
-    # Keep noisy discrete states in first channels for iterative refinement.
     lig.x[:, 0] = torch.randint_like(lig.x[:, 0].long(), low=1, high=10).float()
     if edge.edge_attr.size(1) > 0:
         edge.edge_attr[:, 0] = torch.randint_like(
@@ -225,21 +230,26 @@ def reverse_diffusion_sample(
         lig.pos = x_t
         t_tensor = torch.tensor([t], dtype=torch.long, device=device)
         out = model(data, t=t_tensor)
-        eps_theta = out.coord_noise
 
-        alpha_t = sched.alphas[t]
+        # Model directly predicts clean coordinates x0.
+        # Clamp to the expected COM-normalised ligand range to prevent explosion.
+        x0_hat = out.coord_noise.clamp(-25.0, 25.0)
+
         alpha_bar_t = sched.alpha_bars[t]
         beta_t = sched.betas[t]
-        sigma_t = torch.sqrt(beta_t)
 
-        coeff = beta_t / torch.sqrt(1.0 - alpha_bar_t + 1e-8)
-        mean = (x_t - coeff * eps_theta) / torch.sqrt(alpha_t + 1e-8)
         if t > 0:
+            alpha_bar_prev = sched.alpha_bars[t - 1]
+            alpha_t = sched.alphas[t]
+            # DDPM posterior mean given x0_hat and x_t.
+            coeff_x0 = torch.sqrt(alpha_bar_prev + 1e-8) * beta_t / (1.0 - alpha_bar_t + 1e-8)
+            coeff_xt = torch.sqrt(alpha_t + 1e-8) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t + 1e-8)
+            mean = coeff_x0 * x0_hat + coeff_xt * x_t
+            sigma_t = torch.sqrt(beta_t)
             x_t = mean + sigma_t * torch.randn_like(x_t)
         else:
-            x_t = mean
+            x_t = x0_hat
 
-        # Discrete denoising step: feed argmax states into next iteration.
         atom_logits = out.atom_type_logits
         bond_logits = out.bond_type_logits
         bond_edge_index = out.bond_edge_index
