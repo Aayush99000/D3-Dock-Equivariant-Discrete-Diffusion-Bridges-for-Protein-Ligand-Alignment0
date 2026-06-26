@@ -451,15 +451,6 @@ def main() -> None:
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
     steps_per_epoch = max(len(loader), 1)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer=optimizer,
-        max_lr=args.lr,
-        epochs=args.epochs,
-        steps_per_epoch=steps_per_epoch,
-        pct_start=0.1,
-        div_factor=10.0,
-        final_div_factor=100.0,
-    )
 
     start_epoch = 1
     resume_path = args.resume
@@ -472,10 +463,23 @@ def main() -> None:
         raw_model = model.module if distributed else model
         raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1
         if rank == 0:
             print(f"[D3-Dock] Resuming from epoch {start_epoch}")
+
+    # Build scheduler over only the remaining epochs so OneCycleLR total_steps
+    # matches the actual number of steps that will be taken. Restoring the old
+    # scheduler state fails when --epochs is extended beyond the original run.
+    remaining_epochs = args.epochs - start_epoch + 1
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer=optimizer,
+        max_lr=args.lr,
+        epochs=max(remaining_epochs, 1),
+        steps_per_epoch=steps_per_epoch,
+        pct_start=0.05,
+        div_factor=10.0,
+        final_div_factor=1000.0,
+    )
 
     for epoch in range(start_epoch, args.epochs + 1):
         if sampler is not None:
