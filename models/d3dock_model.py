@@ -24,6 +24,7 @@ from e3nn import o3
 from torch_scatter import scatter
 from torch_geometric.data import HeteroData
 from torch_geometric.nn import radius_graph
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 
 def _get_batch(node_store, n: int, device: torch.device) -> torch.Tensor:
@@ -124,15 +125,17 @@ class SharedEquivariantEncoder(nn.Module):
     def __init__(
         self,
         input_scalar_dim: int,
-        num_scalar_channels: int = 64,
-        num_vector_channels: int = 16,
+        num_scalar_channels: int = 128,
+        num_vector_channels: int = 32,
         lmax: int = 2,
         num_layers: int = 4,
         radial_hidden_dim: int = 128,
+        use_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         self.scalar_dim = num_scalar_channels
         self.vector_dim = num_vector_channels * 3
+        self.use_checkpoint = use_checkpoint
         self.irreps_hidden = o3.Irreps(
             f"{num_scalar_channels}x0e + {num_vector_channels}x1o"
         )
@@ -156,7 +159,10 @@ class SharedEquivariantEncoder(nn.Module):
     ) -> torch.Tensor:
         h = self.input_proj(x_scalar)
         for layer in self.layers:
-            h = layer(h, pos, edge_index)
+            if self.use_checkpoint:
+                h = grad_checkpoint(layer, h, pos, edge_index, use_reentrant=False)
+            else:
+                h = layer(h, pos, edge_index)
         return h
 
 
@@ -268,16 +274,21 @@ class D3DockModel(nn.Module):
         surface_input_dim: int = 5,
         num_atom_classes: int = 32,
         num_bond_classes: int = 6,
-        hidden_scalar_channels: int = 64,
-        hidden_vector_channels: int = 16,
+        hidden_scalar_channels: int = 128,
+        hidden_vector_channels: int = 32,
         lmax: int = 2,
         num_gnn_layers: int = 4,
         protein_radius: float = 6.0,
         protein_max_neighbors: int = 64,
+        ligand_radius: float = 4.5,
+        ligand_max_neighbors: int = 32,
+        use_gradient_checkpointing: bool = True,
     ) -> None:
         super().__init__()
         self.protein_radius = protein_radius
         self.protein_max_neighbors = protein_max_neighbors
+        self.ligand_radius = ligand_radius
+        self.ligand_max_neighbors = ligand_max_neighbors
         self.scalar_dim = hidden_scalar_channels
 
         self.shared_encoder_lig = SharedEquivariantEncoder(
@@ -286,6 +297,7 @@ class D3DockModel(nn.Module):
             num_vector_channels=hidden_vector_channels,
             lmax=lmax,
             num_layers=num_gnn_layers,
+            use_checkpoint=use_gradient_checkpointing,
         )
         self.shared_encoder_prot = SharedEquivariantEncoder(
             input_scalar_dim=protein_input_dim,
@@ -293,6 +305,7 @@ class D3DockModel(nn.Module):
             num_vector_channels=hidden_vector_channels,
             lmax=lmax,
             num_layers=num_gnn_layers,
+            use_checkpoint=use_gradient_checkpointing,
         )
 
         self.irreps_hidden = self.shared_encoder_lig.irreps_hidden
@@ -338,6 +351,23 @@ class D3DockModel(nn.Module):
             max_num_neighbors=self.protein_max_neighbors,
         )
 
+    def _ligand_spatial_edges(
+        self, pos: torch.Tensor, batch: torch.Tensor, bond_edge_index: torch.Tensor
+    ) -> torch.Tensor:
+        """Union of chemical bond edges and spatial radius edges (r=ligand_radius)."""
+        radius_ei = radius_graph(
+            x=pos,
+            r=self.ligand_radius,
+            batch=batch,
+            loop=False,
+            max_num_neighbors=self.ligand_max_neighbors,
+        )
+        combined = torch.cat([bond_edge_index, radius_ei], dim=1)
+        N = pos.size(0)
+        flat = combined[0] * N + combined[1]
+        flat = torch.unique(flat)
+        return torch.stack([flat // N, flat % N], dim=0)
+
     def forward(self, data: HeteroData, t: torch.Tensor) -> D3DockOutput:
         """
         data : HeteroData batch (all coordinates COM-normalized)
@@ -361,9 +391,10 @@ class D3DockModel(nn.Module):
 
         bond_edge_index = data["ligand", "bond", "ligand"].edge_index.long()
         protein_edge_index = self._protein_edges(prot_pos, prot_batch)
+        ligand_edge_index = self._ligand_spatial_edges(lig_pos, lig_batch, bond_edge_index)
 
         # Equivariant encoders.
-        lig_feat = self.shared_encoder_lig(lig_x, lig_pos, bond_edge_index)
+        lig_feat = self.shared_encoder_lig(lig_x, lig_pos, ligand_edge_index)
         prot_feat = self.shared_encoder_prot(prot_x, prot_pos, protein_edge_index)
 
         lig_scalar = lig_feat[:, : self.scalar_dim]
