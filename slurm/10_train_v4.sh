@@ -4,9 +4,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:v100-sxm2:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=128G
-#SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
 #SBATCH --output=/scratch/katoch.aa/d3dock/logs/10_train_v4_%j.out
 #SBATCH --error=/scratch/katoch.aa/d3dock/logs/10_train_v4_%j.err
 
@@ -36,8 +36,8 @@ torchrun \
     --crop-dir   $BASE/outputs/crops \
     --output-dir $OUTPUT \
     --epochs     200 \
-    --batch-size 2 \
-    --num-workers 4 \
+    --batch-size 8 \
+    --num-workers 8 \
     --lr         1e-3 \
     --T          1000 \
     --schedule   cosine \
@@ -45,7 +45,8 @@ torchrun \
     --loss-w-atom  1.0 \
     --loss-w-bond  1.0 \
     --loss-w-phys  0.5 \
-    --save-every 5 \
-    --seed       42
+    --save-every 1 \
+    --seed       42 \
+    --resume     auto
 
-echo "[$(date)] Training complete."
+echo "[$(date)] Training segment complete. Resubmit with: sbatch slurm/10_train_v4.sh"
