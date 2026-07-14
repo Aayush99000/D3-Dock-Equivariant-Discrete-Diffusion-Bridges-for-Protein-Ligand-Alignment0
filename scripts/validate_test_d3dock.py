@@ -90,6 +90,17 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="SDF penetration depth (Å) below which an atom is considered clean (default: 0.1).",
     )
+    p.add_argument(
+        "--save-trajectory",
+        action="store_true",
+        help="Save per-system reverse diffusion trajectory frames as NPZ for demo visualization.",
+    )
+    p.add_argument(
+        "--trajectory-stride",
+        type=int,
+        default=10,
+        help="Save one trajectory frame every N diffusion steps (default: 10).",
+    )
     return p.parse_args()
 
 
@@ -193,7 +204,9 @@ def reverse_diffusion_sample(
     beta_start: float,
     beta_end: float,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    save_trajectory: bool = False,
+    trajectory_stride: int = 10,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list]:
     """
     Reverse process using x0-parameterized DDPM posterior.
 
@@ -225,6 +238,11 @@ def reverse_diffusion_sample(
     atom_logits = None
     bond_logits = None
     bond_edge_index = edge.edge_index
+    trajectory_frames: list = []  # (n_frames, n_atoms, 3) COM-normalised coords
+
+    # Always save first frame (pure noise) for trajectory
+    if save_trajectory:
+        trajectory_frames.append(x_t.detach().cpu().numpy().copy())
 
     for t in reversed(range(T)):
         lig.pos = x_t
@@ -257,7 +275,10 @@ def reverse_diffusion_sample(
         if edge.edge_attr.size(1) > 0:
             edge.edge_attr[:, 0] = bond_logits.argmax(dim=-1).float()
 
-    return x_t, atom_logits, bond_logits, bond_edge_index
+        if save_trajectory and (t % trajectory_stride == 0):
+            trajectory_frames.append(x_t.detach().cpu().numpy().copy())
+
+    return x_t, atom_logits, bond_logits, bond_edge_index, trajectory_frames
 
 
 def _set_mol_coords(mol: Chem.Mol, coords: np.ndarray) -> Chem.Mol:
@@ -458,13 +479,18 @@ def main() -> None:
     success_count = 0
     slo_records: list[dict] = []   # surface-ligand overlap per sample
 
+    traj_dir = None
+    if args.save_trajectory:
+        traj_dir = out_dir / "trajectory"
+        traj_dir.mkdir(parents=True, exist_ok=True)
+
     # Process samples one-by-one for robust molecule serialization.
     for idx in indices:
         rec = dataset.records[idx]
         data = dataset[idx].to(device)
 
         with torch.no_grad():
-            pred_pos, atom_logits, bond_logits, bond_edge_index = reverse_diffusion_sample(
+            pred_pos, atom_logits, bond_logits, bond_edge_index, traj_frames = reverse_diffusion_sample(
                 model=model,
                 data=data,
                 T=args.T,
@@ -472,6 +498,8 @@ def main() -> None:
                 beta_start=args.beta_start,
                 beta_end=args.beta_end,
                 device=device,
+                save_trajectory=args.save_trajectory,
+                trajectory_stride=args.trajectory_stride,
             )
 
         # pred_pos is COM-normalised; recover world-space coords by adding the
@@ -482,6 +510,16 @@ def main() -> None:
         except Exception:
             com = np.zeros(3, dtype=np.float64)
         pred_pos_world = pred_pos.detach().cpu().numpy().astype(np.float64) + com
+
+        if args.save_trajectory and traj_frames and traj_dir is not None:
+            frames_arr = np.stack(traj_frames, axis=0).astype(np.float32)  # (F, N, 3) COM-norm
+            np.savez_compressed(
+                traj_dir / f"{rec.plinder_id}_trajectory.npz",
+                frames=frames_arr,
+                com=com.astype(np.float32),
+                stride=np.int32(args.trajectory_stride),
+                T=np.int32(args.T),
+            )
 
         ref_supplier = Chem.SDMolSupplier(rec.ligand_sdf, sanitize=False, removeHs=False)
         if len(ref_supplier) == 0 or ref_supplier[0] is None:
