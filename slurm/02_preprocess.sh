@@ -23,6 +23,12 @@ echo "Job ID: $SLURM_JOB_ID"
 cd $BASE
 export PYTHONPATH=$BASE:$PYTHONPATH
 
+# Install openbabel if missing
+if ! command -v obabel &>/dev/null; then
+    echo "[$(date)] Installing openbabel into d3dock env..."
+    conda install -y -c conda-forge openbabel
+fi
+
 python scripts/preprocess_discrete_states.py \
     --input-csv      $BASE/outputs/filtered_systems.csv \
     --output-dir     $BASE/outputs/preprocessed \
