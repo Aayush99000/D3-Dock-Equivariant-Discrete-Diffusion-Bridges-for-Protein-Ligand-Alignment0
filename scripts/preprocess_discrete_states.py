@@ -168,6 +168,18 @@ def process_job(job: Job, output_dir: str, ph: float, ligand_glob: str, protein_
     plinder_id = job.plinder_id
     system_dir = job.base_path
 
+    # Skip multi-chain assemblies whose IDs exceed the 255-byte Linux filename limit.
+    if len(plinder_id) > 200:
+        return JobResult(
+            plinder_id=plinder_id,
+            status="skipped",
+            reason="id_too_long",
+            ligand_input="",
+            protein_input="",
+            ligand_output="",
+            protein_output="",
+        )
+
     system_out_dir = os.path.join(output_dir, plinder_id)
     os.makedirs(system_out_dir, exist_ok=True)
 
