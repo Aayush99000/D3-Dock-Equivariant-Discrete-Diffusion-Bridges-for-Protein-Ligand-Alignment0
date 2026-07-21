@@ -22,6 +22,7 @@ echo "Job ID: $SLURM_JOB_ID"
 
 cd $BASE
 export PYTHONPATH=$BASE:$PYTHONPATH
+export PLINDER_MOUNT=/scratch/katoch.aa/plinder_data
 
 # Verify obabel is available
 if ! command -v obabel &>/dev/null; then

@@ -187,8 +187,17 @@ def process_job(job: Job, output_dir: str, ph: float, ligand_glob: str, protein_
     protein_out = os.path.join(system_out_dir, f"{plinder_id}.clean.pdb")
 
     try:
-        ligand_in = resolve_single_match(system_dir, ligand_glob, "ligand SDF")
-        protein_in = resolve_single_match(system_dir, protein_glob, "protein PDB")
+        from plinder.core import PlinderSystem  # type: ignore
+        ps = PlinderSystem(system_id=plinder_id)
+        protein_in = str(ps.receptor_pdb)
+        ligand_sdf_map = ps.ligand_sdfs
+        if not ligand_sdf_map:
+            raise ValueError("No ligand SDFs found via PlinderSystem")
+        ligand_in = str(list(ligand_sdf_map.values())[0])
+        if not os.path.exists(protein_in):
+            raise FileNotFoundError(f"receptor.pdb missing after download: {protein_in}")
+        if not os.path.exists(ligand_in):
+            raise FileNotFoundError(f"ligand SDF missing after download: {ligand_in}")
     except Exception as exc:
         return JobResult(
             plinder_id=plinder_id,
