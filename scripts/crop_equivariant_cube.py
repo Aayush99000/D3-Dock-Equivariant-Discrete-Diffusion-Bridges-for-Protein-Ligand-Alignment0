@@ -274,6 +274,10 @@ def main() -> None:
 
     rows = []
     for pid in ids:
+        out_npz = os.path.join(args.output_dir, pid, f"{pid}.crop.npz")
+        if os.path.exists(out_npz):
+            rows.append({"plinder_id": pid, "status": "skipped_existing"})
+            continue
         pid, status = process_system(
             plinder_id=pid,
             structures_dir=args.structures_dir,
