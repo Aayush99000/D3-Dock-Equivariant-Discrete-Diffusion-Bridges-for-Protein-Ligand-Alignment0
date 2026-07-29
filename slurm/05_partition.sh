@@ -24,22 +24,13 @@ echo "Job ID: $SLURM_JOB_ID"
 cd $BASE
 export PYTHONPATH=$BASE:$PYTHONPATH
 
-# Find the split parquet (try both common locations)
-SPLIT_PARQUET=""
-for CANDIDATE in \
-    "$PLINDER/splits/split.parquet" \
-    "$PLINDER/splits/splits.parquet" \
-    "$PLINDER/index/splits.parquet"; do
-    if [ -f "$CANDIDATE" ]; then
-        SPLIT_PARQUET="$CANDIDATE"
-        break
-    fi
-done
-
-if [ -z "$SPLIT_PARQUET" ]; then
-    echo "ERROR: Could not find split parquet. Searching..."
-    find /scratch/katoch.aa/plinder_data -name "*.parquet" | grep -i split | head -5
-    exit 1
+# Find or download the split parquet
+SPLIT_PARQUET="$PLINDER/splits/split.parquet"
+if [ ! -f "$SPLIT_PARQUET" ]; then
+    echo "[$(date)] split.parquet not found, downloading from GCS..."
+    mkdir -p $(dirname $SPLIT_PARQUET)
+    curl -L -o $SPLIT_PARQUET \
+        'https://storage.googleapis.com/plinder/2024-06/v2/splits/split.parquet'
 fi
 
 echo "Using split parquet: $SPLIT_PARQUET"
