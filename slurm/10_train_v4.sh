@@ -25,6 +25,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 cd $BASE
 export PYTHONPATH=$BASE:$PYTHONPATH
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 torchrun \
     --standalone \
@@ -35,8 +36,8 @@ torchrun \
     --structures-dir $BASE/outputs/preprocessed \
     --crop-dir   $BASE/outputs/crops \
     --output-dir $OUTPUT \
-    --epochs     100 \
-    --batch-size 16 \
+    --epochs     30 \
+    --batch-size 8 \
     --num-workers 8 \
     --lr         1e-3 \
     --T          1000 \
