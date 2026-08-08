@@ -36,7 +36,7 @@ torchrun \
     --structures-dir $BASE/outputs/preprocessed \
     --crop-dir   $BASE/outputs/crops \
     --output-dir $OUTPUT \
-    --epochs     30 \
+    --epochs     100 \
     --batch-size 8 \
     --num-workers 8 \
     --lr         1e-3 \
